@@ -1,129 +1,96 @@
-            "note": "Descriptive group disparities only; not proof of discrimination. Interpret small groups cautiously."}
-    return reports
+from __future__ import annotations
 
-@app.post("/api/train")
-def train(req: TrainRequest):
-    df = datasets.get(req.dataset_id)
-    if df is None: raise HTTPException(404, "Dataset not found.")
-    if req.target not in df.columns: raise HTTPException(400, "Target column not found.")
-    if not 0.1 <= req.test_size <= 0.4: raise HTTPException(400, "Test size must be between 0.10 and 0.40.")
-    y, positive, original_classes = normalize_binary(df[req.target], req.default_label)
-    valid = df[req.target].notna()
-    df, y = df.loc[valid].copy(), y.loc[valid]
-    excluded = set([req.target] + req.drop_columns + req.demographic_columns)
-    X = df.drop(columns=[c for c in excluded if c in df.columns])
-    if X.shape[1] == 0: raise HTTPException(400, "No predictive features remain after exclusions.")
-    if y.value_counts().min() < 2: raise HTTPException(400, "Each target class needs at least two records.")
+import io
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    confusion_matrix, roc_auc_score
+)
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+# ----------------------------- Configuration -----------------------------
+st.set_page_config(
+    page_title="CREDVION | AI Fairness Audit",
+    page_icon="◈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+BG_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap');
+html, body, [class*="css"] {font-family: 'Manrope', sans-serif;}
+.stApp {background: radial-gradient(ellipse at 80% 0%, #102016 0%, transparent 35%), #050805; color:#F5F7F2;}
+[data-testid="stSidebar"] {background:#080D09; border-right:1px solid #263529;}
+[data-testid="stSidebar"] * {color:#EAF1E8;}
+h1,h2,h3 {color:#F5F7F2 !important; letter-spacing:-.5px;}
+.cred-hero {background:linear-gradient(110deg,#111C13,#0A110B 65%,#142218); border:1px solid #344735; border-radius:18px; padding:30px 34px; margin:5px 0 24px;}
+.cred-kicker {font:10px 'DM Mono'; letter-spacing:2px; color:#A9C19F;}
+.cred-hero h1 {font-size:38px; line-height:1.1; margin:12px 0 8px;}
+.cred-hero h1 span {color:#B7FF35;}
+.cred-hero p {color:#AAB8AA; font-size:13px; max-width:780px; line-height:1.7;}
+.cred-card {background:linear-gradient(145deg,#101810,#0A100B); border:1px solid #29392C; border-radius:12px; padding:17px 19px; min-height:112px;}
+.cred-label {font:10px 'DM Mono'; color:#91A291; letter-spacing:1px; text-transform:uppercase;}
+.cred-value {font-size:27px; font-weight:800; color:#F4F8F2; margin-top:9px;}
+.cred-sub {font-size:10px; color:#718273; margin-top:3px;}
+div.stButton > button, div.stDownloadButton > button {background:#B7FF35; color:#071007; border:0; border-radius:8px; font-weight:800; min-height:42px;}
+div.stButton > button:hover, div.stDownloadButton > button:hover {background:#D0FF80; color:#071007; border:0;}
+.stTabs [data-baseweb="tab"] {color:#A9B7AA;}
+.stTabs [aria-selected="true"] {color:#B7FF35 !important;}
+[data-testid="stMetric"] {background:#101810; border:1px solid #29392C; padding:14px; border-radius:10px;}
+[data-testid="stMetricLabel"] {color:#9CAC9D;}
+[data-testid="stMetricValue"] {color:#F5F7F2;}
+div[data-testid="stDataFrame"] {border:1px solid #29392C; border-radius:9px;}
+.stAlert {border-radius:9px;}
+.small-note {color:#8FA08F;font-size:11px;}
+</style>
+"""
+st.markdown(BG_CSS, unsafe_allow_html=True)
+
+# ----------------------------- Session state -----------------------------
+for key, default in {
+    "dataset": None, "dataset_name": None, "train_result": None,
+    "external_result": None, "external_df": None, "selected_run": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# ----------------------------- Utility functions -----------------------------
+def read_table(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
     try:
-        X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(
-            X, y, df.index, test_size=req.test_size, random_state=42, stratify=y)
-    except ValueError as exc:
-        raise HTTPException(400, f"Unable to create stratified split: {exc}")
-    estimators = {
-        "Credit AI – A": LogisticRegression(max_iter=1200, class_weight="balanced"),
-        "Credit AI – B": RandomForestClassifier(n_estimators=180, min_samples_leaf=2,
-            class_weight="balanced", random_state=42, n_jobs=-1),
-        "Credit AI – C": GradientBoostingClassifier(random_state=42)
-    }
-    run_id = str(uuid.uuid4())
-    result_models = {}
-    for name, estimator in estimators.items():
-        pipe = make_pipeline(X_train, estimator)
-        pipe.fit(X_train, y_train)
-        pred = pipe.predict(X_test)
-        prob = pipe.predict_proba(X_test)[:,1] if hasattr(pipe, "predict_proba") else None
-        metrics = metric_pack(y_test.to_numpy(), pred, prob)
-        fair = fairness_report(df.loc[idx_test], y_test.reset_index(drop=True),
-                               pred, req.demographic_columns)
-        result_models[name] = {"metrics": metrics, "fairness": fair}
-        models[(run_id, name)] = {"pipeline": pipe, "feature_columns": list(X.columns)}
-    evaluations[run_id] = {"dataset_id": req.dataset_id, "target": req.target,
-        "positive_label": positive, "classes": original_classes, "models": result_models,
-        "test_indices": list(map(str, idx_test)), "created_at": datetime.now(timezone.utc).isoformat()}
-    record_history("training", req.dataset_id, f"Trained 3 models; target={req.target}")
-    return {"run_id": run_id, "target": req.target, "positive_label": positive,
-            "test_records": int(len(X_test)), "models": result_models}
+        if name.endswith(".csv"):
+            return pd.read_csv(uploaded_file)
+        if name.endswith(".xlsx") or name.endswith(".xls"):
+            return pd.read_excel(uploaded_file)
+    except Exception as exc:
+        raise ValueError(f"Unable to read this file: {exc}") from exc
+    raise ValueError("Please upload a CSV, XLS or XLSX file.")
 
-class ExternalRequest(BaseModel):
-    actual_column: str
-    prediction_column: str
-    demographic_columns: list[str] = []
-    default_label: Optional[str] = None
+def normalize_target(series: pd.Series, positive_label: str | None):
+    values = list(series.dropna().unique())
+    if len(values) != 2:
+        raise ValueError(f"Target must contain exactly two classes. Found {len(values)}.")
+    if positive_label is not None and str(positive_label) != "":
+        found = [v for v in values if str(v) == str(positive_label)]
+        if not found:
+            raise ValueError("The selected positive/default label is not present in the target column.")
+        positive = found[0]
+    else:
+        positive = sorted(values, key=lambda x: str(x))[-1]
+    return (series == positive).astype(int), positive, values
 
-@app.post("/api/external-audit")
-async def external_audit(file: UploadFile = File(...), config: str = ""):
-    import json
-    try: cfg = ExternalRequest(**json.loads(config))
-    except Exception as exc: raise HTTPException(400, f"Invalid audit configuration: {exc}")
-    df = read_upload(file.filename or "predictions.csv", await file.read())
-    for c in [cfg.actual_column, cfg.prediction_column]:
-        if c not in df.columns: raise HTTPException(400, f"Column '{c}' not found.")
-    actual, positive, _ = normalize_binary(df[cfg.actual_column], cfg.default_label)
-    pred_vals = df[cfg.prediction_column]
-    # Predicted labels are mapped to the same positive convention as actual labels.
-    unique_pred = list(pred_vals.dropna().unique())
-    if len(unique_pred) != 2: raise HTTPException(400, "Prediction column must contain exactly two classes.")
-    positive_pred = next((v for v in unique_pred if str(v) == positive), sorted(unique_pred, key=lambda x:str(x))[-1])
-    mask = df[cfg.actual_column].notna() & pred_vals.notna()
-    actual, pred = actual[mask], (pred_vals[mask] == positive_pred).astype(int)
-    selected = df.loc[mask]
-    metrics = metric_pack(actual.to_numpy(), pred.to_numpy())
-    fair = fairness_report(selected, actual.reset_index(drop=True), pred.to_numpy(), cfg.demographic_columns)
-    audit_id = str(uuid.uuid4())
-    evaluations[audit_id] = {"dataset_id":"external-upload", "target":cfg.actual_column,
-        "models":{"External AI": {"metrics":metrics,"fairness":fair}},
-        "created_at":datetime.now(timezone.utc).isoformat()}
-    record_history("external_audit", "external-upload", f"Audited external predictions; n={len(actual)}")
-    return {"audit_id":audit_id, "models":evaluations[audit_id]["models"],
-            "rows_evaluated":int(len(actual)), "positive_label":positive}
-
-@app.get("/api/runs/{run_id}")
-def get_run(run_id: str):
-    if run_id not in evaluations: raise HTTPException(404, "Evaluation not found.")
-    return evaluations[run_id]
-
-@app.get("/api/runs/{run_id}/errors")
-def get_errors(run_id: str, model: str):
-    ev = evaluations.get(run_id)
-    if not ev: raise HTTPException(404, "Evaluation not found.")
-    if model not in ev["models"]: raise HTTPException(404, "Model not found.")
-    return {"message":"Detailed row-level error inspection is not retained in this minimal build. Aggregate confusion-matrix errors are available.",
-            "metrics":ev["models"][model]["metrics"]}
-
-@app.get("/api/runs/{run_id}/report.csv")
-def report_csv(run_id: str):
-    ev = evaluations.get(run_id)
-    if not ev: raise HTTPException(404, "Evaluation not found.")
-    rows=[]
-    for name, data in ev["models"].items():
-        rows.append({"model":name, **data["metrics"]})
-    out=io.StringIO(); pd.DataFrame(rows).to_csv(out,index=False)
-    return StreamingResponse(iter([out.getvalue()]), media_type="text/csv",
-        headers={"Content-Disposition":f'attachment; filename="credvion_{run_id[:8]}_audit.csv"'})
-
-@app.get("/api/runs/{run_id}/report.pdf")
-def report_pdf(run_id: str):
-    ev=evaluations.get(run_id)
-    if not ev: raise HTTPException(404,"Evaluation not found.")
-    try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-        from reportlab.lib import colors
-        from reportlab.lib.styles import getSampleStyleSheet
-    except ImportError: raise HTTPException(500,"Install reportlab to generate PDF reports.")
-    buff=io.BytesIO(); doc=SimpleDocTemplate(buff,pagesize=A4); styles=getSampleStyleSheet()
-    story=[Paragraph("CREDVION — AI CREDIT-RISK AUDIT",styles["Title"]),
-           Paragraph(f"Evaluation date: {ev['created_at']}",styles["Normal"]),
-           Paragraph(f"Dataset: {ev['dataset_id']} | Target: {ev['target']}",styles["Normal"]),Spacer(1,16)]
-    data=[["Model","Accuracy","Precision","Recall","F1","FP","FN","Error rate"]]
-    for name,item in ev["models"].items():
-        m=item["metrics"]; data.append([name,*[f"{m[k]:.4f}" for k in ["accuracy","precision","recall","f1"]],
-                                        str(m["fp"]),str(m["fn"]),f"{m['error_rate']:.4f}"])
-    table=Table(data,repeatRows=1)
-    table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#173d2b")),
-        ("TEXTCOLOR",(0,0),(-1,0),colors.white),("GRID",(0,0),(-1,-1),.4,colors.grey),
-        ("PADDING",(0,0),(-1,-1),7)]))
-    story += [table,Spacer(1,14),Paragraph("Fairness interpretation",styles["Heading2"]),
-              Paragraph("Group differences are descriptive signals for further investigation. They do not, by themselves, establish discrimination or causation. Review sample sizes, data quality, context and applicable law.",styles["BodyText"]),
-              Paragraph("Limitations: This report evaluates supplied labels and predictions on the evaluated records only. It is not a lending decision or legal compliance certification.",styles["BodyText"])]
-
+def build_pipeline(X: pd.DataFrame, estimator):
