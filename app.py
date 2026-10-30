@@ -94,3 +94,37 @@ def normalize_target(series: pd.Series, positive_label: str | None):
     return (series == positive).astype(int), positive, values
 
 def build_pipeline(X: pd.DataFrame, estimator):
+    numeric_cols = X.select_dtypes(include=["number", "bool"]).columns.tolist()
+    categorical_cols = [c for c in X.columns if c not in numeric_cols]
+
+    transformers = []
+
+    if numeric_cols:
+        transformers.append((
+            "numeric",
+            Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+            ]),
+            numeric_cols
+        ))
+
+    if categorical_cols:
+        transformers.append((
+            "categorical",
+            Pipeline([
+                ("imputer", SimpleImputer(strategy="most_frequent")),
+                ("encoder", OneHotEncoder(handle_unknown="ignore")),
+            ]),
+            categorical_cols
+        ))
+
+    if not transformers:
+        raise ValueError("No usable feature columns remain.")
+
+    preprocessor = ColumnTransformer(transformers, remainder="drop")
+
+    return Pipeline([
+        ("preprocessor", preprocessor),
+        ("model", estimator)
+    ])
