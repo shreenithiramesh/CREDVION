@@ -1,9 +1,0 @@
-
-streamlit
-pandas
-numpy
-scikit-learn
-plotly
-openpyxl
-xlrd
-reportlab
